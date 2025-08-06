@@ -781,26 +781,46 @@ class MCPConfigTransport(ClientTransport):
         if len(self.config.mcpServers) == 0:
             raise ValueError("No MCP servers defined in the config")
 
-        # if there's exactly one server, create a client for that server
-        elif len(self.config.mcpServers) == 1:
-            self.transport = list(self.config.mcpServers.values())[0].to_transport()
+        # Defer transport creation until connect_session is called
+        self.transport = None
+        self._transport_creation_lock = None
 
-        # otherwise create a composite client
-        else:
-            composite_server = FastMCP()
-
-            for name, server in self.config.mcpServers.items():
-                composite_server.mount(
-                    prefix=name,
-                    server=FastMCP.as_proxy(backend=server.to_transport()),
+    async def _ensure_transport_created(self):
+        """Ensure the transport is created, with thread-safe initialization."""
+        if self.transport is not None:
+            return
+            
+        # Import anyio here to avoid import at module level
+        import anyio
+        
+        if self._transport_creation_lock is None:
+            self._transport_creation_lock = anyio.Lock()
+            
+        async with self._transport_creation_lock:
+            # Double-check pattern
+            if self.transport is not None:
+                return
+                
+            # if there's exactly one server, create a client for that server
+            if len(self.config.mcpServers) == 1:
+                self.transport = list(self.config.mcpServers.values())[0].to_transport()
+            # otherwise create a composite client with parallel mounting
+            else:
+                from fastmcp.utilities.mcp_config import composite_server_from_mcp_config_async
+                
+                composite_server = await composite_server_from_mcp_config_async(
+                    self.config, 
+                    name_as_prefix=True,
+                    max_concurrent=10,  # Limit to 10 concurrent mounts
+                    fail_fast=False     # Continue with working servers on errors
                 )
-
-            self.transport = FastMCPTransport(mcp=composite_server)
+                self.transport = FastMCPTransport(mcp=composite_server)
 
     @contextlib.asynccontextmanager
     async def connect_session(
         self, **session_kwargs: Unpack[SessionKwargs]
     ) -> AsyncIterator[ClientSession]:
+        await self._ensure_transport_created()
         async with self.transport.connect_session(**session_kwargs) as session:
             yield session
 
